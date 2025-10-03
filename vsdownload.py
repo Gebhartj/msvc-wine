@@ -706,13 +706,15 @@ def unpackVsix(file, dest, listing):
         with open(listing, "w") as f:
             for n in zip.namelist():
                 f.write(n + "\r\n")
-    contents = os.path.join(temp, "Contents")
-    if os.access(contents, os.F_OK):
-        mergeTrees(contents, dest)
-    # This archive directory structure is used in WDK.vsix.
-    msbuild = os.path.join(temp, "$MSBuild")
-    if os.access(msbuild, os.F_OK):
-        mergeTrees(msbuild, os.path.join(dest, "MSBuild"))
+    
+    # Merge all contents from the temporary VSIX extraction directory into the final destination.
+    # This ensures all files, including those not under "Contents" or "$MSBuild", are moved.
+    for item_name in os.listdir(temp):
+        src_item_path = os.path.join(temp, item_name)
+        dest_item_path = os.path.join(dest, item_name)
+        mergeTrees(src_item_path, dest_item_path)
+    
+    # Clean up the temporary VSIX extraction directory
     shutil.rmtree(temp)
 
 def unpackWin10SDK(src, payloads, dest):
