@@ -669,8 +669,6 @@ class Payload:
             for f in tree.findall("File"):
                 if f.get("Binary") == "yes":
                     self.binary_files[f.get("SourcePath").lower()] = True
-    def is_binary(self, name):
-        return name.lower() in self.binary_files
 
 def unpackVsix(file, dest, listing, payload):
     temp = os.path.join(dest, "vsix")
@@ -681,8 +679,24 @@ def unpackVsix(file, dest, listing, payload):
                 continue
             with zip.open(info, "r") as f:
                 contents = f.read()
-            # if not payload.is_binary(info.filename):
-            #     contents = contents.replace(b'\n', b'\r\n')
+            if info.filename.lower() not in payload.binary_files:
+                try:
+                    if contents.startswith(b'\xff\xfe'): # UTF-16 LE
+                        text = contents[2:].decode('utf-16-le')
+                        text = text.replace('\r\n', '\n').replace('\n', '\r\n')
+                        contents = b'\xff\xfe' + text.encode('utf-16-le')
+                    elif contents.startswith(b'\xfe\xff'): # UTF-16 BE
+                        text = contents[2:].decode('utf-16-be')
+                        text = text.replace('\r\n', '\n').replace('\n', '\r\n')
+                        contents = b'\xfe\xff' + text.encode('utf-16-be')
+                    else:
+                        # Try to decode as utf-8. If it fails, it's probably binary.
+                        text = contents.decode('utf-8')
+                        text = text.replace('\r\n', '\n').replace('\n', '\r\n')
+                        contents = text.encode('utf-8')
+                except UnicodeDecodeError:
+                    # Not a text file we can handle, leave it as is.
+                    pass
             target = os.path.join(temp, info.filename)
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, "wb") as d:
