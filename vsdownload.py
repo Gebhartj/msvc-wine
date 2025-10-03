@@ -645,14 +645,57 @@ def mergeTrees(src, dest):
 
 def unzipFiltered(zip, dest):
     tmp = os.path.join(dest, "extract")
+    makedirs(tmp) # Ensure tmp directory exists for zip.extract
+
     for f in zip.infolist():
         name = urllib.parse.unquote(f.filename)
-        if "/" in name:
-            sep = name.rfind("/")
-            dir = os.path.join(dest, name[0:sep])
-            makedirs(dir)
-        extracted = zip.extract(f, tmp)
-        shutil.move(extracted, os.path.join(dest, name))
+        extracted_from_zip_path = zip.extract(f, tmp) # This extracts to tmp/filename
+
+        final_target_path = os.path.join(dest, name)
+        # Ensure the parent directory for the final file exists
+        os.makedirs(os.path.dirname(final_target_path), exist_ok=True)
+
+        # Check if the file is a text file and might need encoding conversion
+        # Common text file extensions that might be UTF-16 in VS packages
+        text_extensions = (
+            ".rc", ".h", ".hpp", ".cpp", ".c", ".txt", ".idl", ".asm", ".def",
+            ".manifest", ".props", ".targets", ".xml", ".json", ".xaml", ".cs",
+            ".vb", ".js", ".ts", ".css", ".html", ".htm", ".md", ".ps1", ".cmd",
+            ".bat", ".py", ".sh", ".mak", ".cmake", ".sln", ".vcxproj", ".filters",
+            ".user", ".editorconfig", ".gitattributes", ".gitignore", ".editorconfig"
+        )
+        
+        converted = False
+        if name.lower().endswith(text_extensions):
+            try:
+                with open(extracted_from_zip_path, "rb") as temp_f:
+                    bom = temp_f.read(2)
+                    temp_f.seek(0) # Reset file pointer
+
+                    if bom == b'\xff\xfe': # UTF-16 LE BOM
+                        content = temp_f.read().decode('utf-16-le')
+                        with open(final_target_path, "w", encoding='utf-8') as out_f:
+                            out_f.write(content)
+                        converted = True
+                    elif bom == b'\xfe\xff': # UTF-16 BE BOM
+                        content = temp_f.read().decode('utf-16-be')
+                        with open(final_target_path, "w", encoding='utf-8') as out_f:
+                            out_f.write(content)
+                        converted = True
+            except UnicodeDecodeError:
+                # Not a valid UTF-16 file, or not a text file despite extension
+                pass
+            except Exception as e:
+                print(f"WARNING: Error processing file {name} for encoding conversion: {e}", file=sys.stderr)
+
+        if not converted:
+            # If not converted, or not a text file, move it as is
+            shutil.move(extracted_from_zip_path, final_target_path)
+        else:
+            # If converted, the file was already written to final_target_path,
+            # so just remove the temporary extracted file.
+            os.remove(extracted_from_zip_path)
+
     shutil.rmtree(tmp)
 
 def unpackVsix(file, dest, listing):
