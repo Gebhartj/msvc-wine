@@ -88,7 +88,6 @@ def getArgsParser():
     parser.add_argument("--host-arch", metavar="arch", choices=["x86", "x64", "arm64"], help="Specify the host architecture of packages to install")
     parser.add_argument("--only-host", default=True, action=OptionalBoolean, help="Only download packages that match host arch")
     parser.add_argument("--skip-patch", action="store_true", help="Don't patch downloaded packages")
-    parser.add_argument("--no-binaries", action="store_true", help="Skip downloading compiler binaries and other executables, only download headers, resource files, and libraries")
     return parser
 
 def setPackageSelectionMSVC16(args, packages, userversion, sdk, toolversion, defaultPackages):
@@ -328,17 +327,6 @@ def getPackages(manifest, arch):
         packages[id].append(p)
     for key in packages:
         packages[key] = sorted(packages[key], key=functools.cmp_to_key(functools.partial(prioritizePackage, arch)))
-    # Mark packages as binary if they contain executables or libraries
-    for key in packages:
-        p = packages[key][0]
-        is_binary = False
-        if "payloads" in p:
-            for payload in p["payloads"]:
-                name = getPayloadName(payload).lower()
-                if name.endswith(".exe") or name.endswith(".dll") or name.endswith(".lib"):
-                    is_binary = True
-                    break
-        p["isBinary"] = is_binary
     return packages
 
 def listPackageType(packages, type):
@@ -443,9 +431,6 @@ def printDepends(packages, target, constraints, indent, args):
         elif not matchPackageTargetArch(p, args.architecture):
             ignorestr = " (TargetArchMismatch)"
             ignore = True
-        elif args.no_binaries and p.get("isBinary", False):
-            ignorestr = " (NoBinaries)"
-            ignore = True
     print(indent + target + chipstr + deptypestr + ignorestr)
     if ignore:
         return
@@ -511,8 +496,6 @@ def aggregateDepends(packages, included, target, constraints, args):
         if deptype == "Optional" and not args.include_optional:
             continue
         if deptype == "Recommended" and args.skip_recommended:
-            continue
-        if args.no_binaries and p.get("isBinary", False):
             continue
         ret.extend(aggregateDepends(packages, included, target, constraints, args))
     return ret
@@ -660,36 +643,26 @@ def mergeTrees(src, dest):
         else:
             shutil.move(srcname, destname)
 
-class Payload:
-    def __init__(self, p):
-        self.p = p
-        self.binary_files = {}
-        if "layout" in p:
-            tree = ET.fromstring(p["layout"])
-            for f in tree.findall("File"):
-                if f.get("Binary") == "yes":
-                    self.binary_files[f.get("SourcePath").lower()] = True
-    def is_binary(self, name):
-        return name.lower() in self.binary_files
+def unzipFiltered(zip, dest):
+    tmp = os.path.join(dest, "extract")
+    for f in zip.infolist():
+        name = urllib.parse.unquote(f.filename)
+        if "/" in name:
+            sep = name.rfind("/")
+            dir = os.path.join(dest, name[0:sep])
+            makedirs(dir)
+        extracted = zip.extract(f, tmp)
+        shutil.move(extracted, os.path.join(dest, name))
+    shutil.rmtree(tmp)
 
-def unpackVsix(file, dest, listing, payload):
+def unpackVsix(file, dest, listing):
     temp = os.path.join(dest, "vsix")
     makedirs(temp)
     with zipfile.ZipFile(file, "r") as zip:
-        for info in zip.infolist():
-            if info.is_dir():
-                continue
-            with zip.open(info, "r") as f:
-                contents = f.read()
-            if not payload.is_binary(info.filename) and not ".lib" in info.filename:
-                contents = contents.replace(b'\n', b'\r\n')
-            target = os.path.join(temp, info.filename)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            with open(target, "wb") as d:
-                d.write(contents)
+        unzipFiltered(zip, temp)
         with open(listing, "w") as f:
             for n in zip.namelist():
-                f.write(n + "\n")
+                f.write(n + "\r\n")
     contents = os.path.join(temp, "Contents")
     if os.access(contents, os.F_OK):
         mergeTrees(contents, dest)
@@ -704,36 +677,119 @@ def unpackWin10SDK(src, payloads, dest):
     # Note, this extracts some files into Program Files/..., and some
     # files directly in the root unpack directory. The files we need
     # are under Program Files/... though.
-    for msi in glob.glob(os.path.join(payloads, "Installers", "*.msi")):
-        unpackMsi(msi, dest)
+    # On Windows, msiexec extracts files to the root unpack directory.
+    # To be consistent, symlink Program Files to root.
+    if sys.platform != "win32" and not os.access(os.path.join(dest, "Program Files"), os.F_OK):
+        os.symlink(".", os.path.join(dest, "Program Files"), target_is_directory=True)
+
+    for payload in payloads:
+        name = getPayloadName(payload)
+        if name.endswith(".msi"):
+            print("Extracting " + name)
+            srcfile = os.path.join(src, name)
+            if sys.platform == "win32":
+                # The path to TARGETDIR need to be quoted in the case of spaces.
+                cmd = "msiexec /a \"%s\" /qn TARGETDIR=\"%s\"" % (srcfile, os.path.abspath(dest))
+            else:
+                cmd = ["msiextract", "-C", dest, srcfile]
+            with open(os.path.join(dest, "WinSDK-" + getPayloadName(payload) + "-listing.txt"), "w") as log:
+                subprocess.check_call(cmd, stdout=log)
 
 def unpackWin10WDK(src, dest):
-    unpackMsi(os.path.join(src, "WDK"), dest)
-    unpackMsi(os.path.join(src, "WDK_Addon_Spectre"), dest)
-    unpackMsi(os.path.join(src, "WDK_Addon_Arm64"), dest)
+    print("Unpacking WDK installers from", src)
 
-def unpackMsi(file, dest):
-    subprocess.check_call(["msiextract", "-C", dest, file])
+    # WDK installers downloaded by wdksetup.exe include a huge pile of
+    # non-WDK installers, just skip these.
+    for srcfile in glob.glob(src + "/Windows Driver*.msi"):
+        name = os.path.basename(srcfile)
+        print("Extracting", name)
 
-def unpackCab(file, dest):
-    subprocess.check_call(["cabextract", "-d", dest, file])
+        # Do not try to run msiexec here because TARGETDIR
+        # does not work with WDK installers.
+        cmd = ["msiextract", "-C", dest, srcfile]
 
-def unpackNupkg(file, dest):
-    with zipfile.ZipFile(file, "r") as zip:
-        for info in zip.infolist():
-            # When unpacking nupkg files, we're only interested in the "tools"
-            # subdirectory. The rest is metadata that we don't need.
-            if info.filename.startswith("tools/"):
-                info.filename = info.filename[len("tools/"):]
-                if len(info.filename) > 0:
-                    zip.extract(info, dest)
+        payloadName, _ = os.path.splitext(name)
+        with open(os.path.join(dest, "WDK-" + payloadName + "-listing.txt"), "w") as log:
+            subprocess.check_call(cmd, stdout=log)
 
-def copyDependentAssemblies(file):
-    if not os.path.isfile(file + ".config"):
+    # WDK includes a VS extension, unpack it before copying the extracted files.
+    for vsix in glob.glob(dest + "/**/WDK.vsix", recursive=True):
+        name = os.path.basename(vsix)
+        print("Unpacking WDK VS extension", name)
+
+        payloadName, _ = os.path.splitext(name)
+        listing = os.path.join(dest, "WDK-VS-" + payloadName + "-listing.txt")
+        unpackVsix(vsix, dest, listing)
+
+    # Merge incorrectly extracted 'Build' and 'build' directory trees.
+    # The WDK 'build' tree must be versioned.
+    kitsPath = os.path.join(dest, "Program Files", "Windows Kits", "10")
+    brokenBuildDir = os.path.join(kitsPath, "Build")
+    for buildDir in glob.glob(kitsPath + "/build/10.*/"):
+        wdkVersion = buildDir.split("/")[-2];
+        print("Merging WDK 'Build' and 'build' directories into version", wdkVersion);
+        mergeTrees(brokenBuildDir, buildDir)
+    shutil.rmtree(brokenBuildDir)
+
+    # Move the WDK .props files into a versioned directory.
+    propsPath = os.path.join(kitsPath, "DesignTime", "CommonConfiguration", "Neutral", "WDK");
+    versionedPath = os.path.join(propsPath, wdkVersion)
+    makedirs(versionedPath)
+    for props in glob.glob(propsPath + "/*.props"):
+        filename = os.path.basename(props)
+        print("Moving", filename, "into version", wdkVersion);
+        shutil.move(props, os.path.join(versionedPath, filename))
+
+def extractPackages(selected, cache, dest):
+    makedirs(dest)
+    # The path name casing is not consistent across packages, or even within a single package.
+    # Manually create top-level folders before extracting packages to ensure the desired casing.
+    makedirs(os.path.join(dest, "MSBuild"))
+    for p in selected:
+        type = p["type"]
+        dir = os.path.join(cache, getPackageKey(p))
+        if type == "Component" or type == "Workload" or type == "Group":
+            continue
+        if type == "Vsix":
+            print("Unpacking " + p["id"])
+            for payload in p["payloads"]:
+                unpackVsix(os.path.join(dir, getPayloadName(payload)), dest, os.path.join(dest, getPackageKey(p) + "-listing.txt"))
+        elif p["id"].startswith("Win10SDK") or p["id"].startswith("Win11SDK"):
+            print("Unpacking " + p["id"])
+            unpackWin10SDK(dir, p["payloads"], dest)
+        else:
+            print("Skipping unpacking of " + p["id"] + " of type " + type)
+
+def patchPackages(dest):
+    patches = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patches")
+    if not os.path.isdir(patches):
         return
-    dest = os.path.dirname(file)
+    for patch in glob.iglob(os.path.join(patches, "**"), recursive=True):
+        if os.path.isdir(patch):
+            continue
+        p = os.path.relpath(patch, patches)
+        f, op = os.path.splitext(p)
+        if op == ".patch":
+            if os.access(os.path.join(dest, f), os.F_OK):
+                # Check if the patch has already been applied by attempting a reverse application; skip if already applied.
+                if subprocess.call(["git", "--work-tree=.", "apply", "--quiet", "--reverse", "--check", patch], cwd=dest) != 0:
+                    print("Patching " + f)
+                    subprocess.check_call(["git", "--work-tree=.", "apply", patch], cwd=dest)
+        elif op == ".remove":
+            if os.access(os.path.join(dest, f), os.F_OK):
+                print("Removing " + f)
+                os.remove(os.path.join(dest, f))
+        else:
+            print("Copying " + p)
+            os.makedirs(os.path.dirname(os.path.join(dest, p)), exist_ok=True)
+            shutil.copyfile(patch, os.path.join(dest, p))
+
+def copyDependentAssemblies(app):
+    if not os.path.isfile(app + ".config"):
+        return
+    dest = os.path.dirname(app)
     ns = "{urn:schemas-microsoft-com:asm.v1}"
-    configuration = ET.parse(file + ".config")
+    configuration = ET.parse(app + ".config")
     for codeBase in configuration.findall(f"./runtime/{ns}assemblyBinding/{ns}dependentAssembly/{ns}codeBase/[@href]"):
         href = codeBase.attrib["href"].replace("\\", "/")
         src = os.path.join(dest, href)
@@ -741,26 +797,25 @@ def copyDependentAssemblies(file):
             shutil.copy(src, dest)
 
 def moveVCSDK(unpack, dest):
-    # Move the unpacked results to the final destination.
-    # The MSVC tools are under VC/.
-    mergeTrees(os.path.join(unpack, "VC"), os.path.join(dest, "VC"))
-    # The SDK files are under "Program Files/Windows Kits/10".
-    sdk = os.path.join(unpack, "Program Files", "Windows Kits", "10")
-    if not os.path.isdir(sdk):
-        # In older VS versions, the SDK was instead under "Windows Kits/10".
-        sdk = os.path.join(unpack, "Windows Kits", "10")
-    mergeTrees(sdk, os.path.join(dest, "Windows Kits", "10"))
-    # DIA is under "DIA SDK".
-    mergeTrees(os.path.join(unpack, "DIA SDK"), os.path.join(dest, "DIA SDK"))
-    # MSBuild is under MSBuild/.
-    mergeTrees(os.path.join(unpack, "MSBuild"), os.path.join(dest, "MSBuild"))
-    # Some other tools are installed right in the root.
-    for name in ["rc.exe", "rcdll.dll"]:
-        if os.path.exists(os.path.join(unpack, name)):
-            shutil.move(os.path.join(unpack, name), os.path.join(dest, name))
+    # Move some components out from the unpack directory,
+    # allowing the rest of unpacked files to be removed.
+    components = [
+        "VC",
+        "Windows Kits",
+        # The DIA SDK isn't necessary for normal use, but can be used when e.g.
+        # compiling LLVM.
+        "DIA SDK",
+        # MSBuild is the standard VC build tool.
+        "MSBuild",
+        # This directory contains batch scripts to setup Developer Command Prompt.
+        # Environment variable VS170COMNTOOLS points to this directory, and some
+        # tools use it to locate VS installation root and MSVC toolchains.
+        os.path.join("Common7", "Tools"),
+    ]
+    for dir in filter(None, components):
+        mergeTrees(os.path.join(unpack, dir), os.path.join(dest, dir))
 
-
-def main():
+if __name__ == "__main__":
     parser = getArgsParser()
     args = parser.parse_args()
     lowercaseIgnores(args)
@@ -852,39 +907,7 @@ def main():
         else:
             unpack = os.path.join(dest, "unpack")
 
-        for p in selected:
-            payload = Payload(p)
-            if not "payloads" in p:
-                continue
-            size = sumInstalledSize([p])
-            print("Unpacking %s (%s)" % (p["id"], formatSize(size)), flush=True)
-            for payload_file in p["payloads"]:
-                name = getPayloadName(payload_file)
-                file = os.path.join(cache, getPackageKey(p), name)
-                if name.endswith(".vsix"):
-                    listing = os.path.join(cache, getPackageKey(p), name + ".txt")
-                    unpackVsix(file, unpack, listing, payload)
-                elif name.endswith(".zip"):
-                    with zipfile.ZipFile(file, "r") as z:
-                        for info in z.infolist():
-                            if info.is_dir():
-                                continue
-                            with z.open(info, "r") as f:
-                                contents = f.read()
-                            if not payload.is_binary(info.filename):
-                                contents = contents.replace(b'\n', b'\r\n')
-                            target = os.path.join(unpack, info.filename)
-                            os.makedirs(os.path.dirname(target), exist_ok=True)
-                            with open(target, "wb") as d:
-                                d.write(contents)
-                elif name.endswith(".msi"):
-                    unpackMsi(file, unpack)
-                elif name.endswith(".cab"):
-                    unpackCab(file, unpack)
-                elif name.endswith(".nupkg"):
-                    unpackNupkg(file, unpack)
-                else:
-                    print("Unknown payload type for %s" % name)
+        extractPackages(selected, cache, unpack)
 
         if args.with_wdk_installers is not None:
             unpackWin10WDK(args.with_wdk_installers, unpack)
@@ -899,10 +922,8 @@ def main():
             moveVCSDK(unpack, dest)
             if not args.keep_unpack:
                 shutil.rmtree(unpack)
-            # No patching required in original script
+            if not args.skip_patch and args.major == 17: # Only apply patches to latest VS
+                patchPackages(dest)
     finally:
         if tempcache != None:
             shutil.rmtree(tempcache)
-
-if __name__ == "__main__":
-    main()
