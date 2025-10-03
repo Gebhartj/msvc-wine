@@ -88,6 +88,7 @@ def getArgsParser():
     parser.add_argument("--host-arch", metavar="arch", choices=["x86", "x64", "arm64"], help="Specify the host architecture of packages to install")
     parser.add_argument("--only-host", default=True, action=OptionalBoolean, help="Only download packages that match host arch")
     parser.add_argument("--skip-patch", action="store_true", help="Don't patch downloaded packages")
+    parser.add_argument("--no-binaries", action="store_true", help="Skip downloading compiler binaries and other executables, only download headers, resource files, and libraries")
     return parser
 
 def setPackageSelectionMSVC16(args, packages, userversion, sdk, toolversion, defaultPackages):
@@ -327,6 +328,17 @@ def getPackages(manifest, arch):
         packages[id].append(p)
     for key in packages:
         packages[key] = sorted(packages[key], key=functools.cmp_to_key(functools.partial(prioritizePackage, arch)))
+    # Mark packages as binary if they contain executables or libraries
+    for key in packages:
+        p = packages[key][0]
+        is_binary = False
+        if "payloads" in p:
+            for payload in p["payloads"]:
+                name = getPayloadName(payload).lower()
+                if name.endswith(".exe") or name.endswith(".dll") or name.endswith(".lib"):
+                    is_binary = True
+                    break
+        p["isBinary"] = is_binary
     return packages
 
 def listPackageType(packages, type):
@@ -431,6 +443,9 @@ def printDepends(packages, target, constraints, indent, args):
         elif not matchPackageTargetArch(p, args.architecture):
             ignorestr = " (TargetArchMismatch)"
             ignore = True
+        elif args.no_binaries and p.get("isBinary", False):
+            ignorestr = " (NoBinaries)"
+            ignore = True
     print(indent + target + chipstr + deptypestr + ignorestr)
     if ignore:
         return
@@ -496,6 +511,8 @@ def aggregateDepends(packages, included, target, constraints, args):
         if deptype == "Optional" and not args.include_optional:
             continue
         if deptype == "Recommended" and args.skip_recommended:
+            continue
+        if args.no_binaries and p.get("isBinary", False):
             continue
         ret.extend(aggregateDepends(packages, included, target, constraints, args))
     return ret
@@ -647,13 +664,35 @@ class Payload:
     def __init__(self, p):
         self.p = p
         self.binary_files = {}
-        if "layout" in p:
+        # Remember whether a layout was provided; if not, we fall back to extension-based heuristics
+        self.has_layout = "layout" in p
+        if self.has_layout:
             tree = ET.fromstring(p["layout"])
             for f in tree.findall("File"):
                 if f.get("Binary") == "yes":
                     self.binary_files[f.get("SourcePath").lower()] = True
     def is_binary(self, name):
+        # If layout was provided, this reflects that information.
         return name.lower() in self.binary_files
+
+def should_convert(name, payload):
+    # Only convert LF->CRLF for known textual file extensions.
+    # If payload layout explicitly marks a file as binary, don't convert.
+    text_exts = {
+        ".txt", ".md", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".inl",
+        ".rc", ".idl", ".sln", ".vcxproj", ".filters", ".props", ".targets",
+        ".xml", ".json", ".html", ".htm", ".bat", ".cmd", ".ps1", ".sh",
+        ".yml", ".yaml", ".rsp", ".def", ".csv", ".ini", ".cfg", ".nuspec",
+        ".txt", ".log", ".manifest", ".py", ".pl", ".rb", ".makefile", ".mk"
+    }
+    ext = os.path.splitext(name)[1].lower()
+    if ext in text_exts:
+        # If layout exists and marks this file as binary, don't convert.
+        if getattr(payload, "has_layout", False):
+            return not payload.is_binary(name)
+        # No layout: rely on extension heuristic and convert.
+        return True
+    return False
 
 def unpackVsix(file, dest, listing, payload):
     temp = os.path.join(dest, "vsix")
@@ -664,7 +703,7 @@ def unpackVsix(file, dest, listing, payload):
                 continue
             with zip.open(info, "r") as f:
                 contents = f.read()
-            if not payload.is_binary(info.filename):
+            if should_convert(info.filename, payload):
                 contents = contents.replace(b'\n', b'\r\n')
             target = os.path.join(temp, info.filename)
             os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -854,7 +893,7 @@ def main():
                                 continue
                             with z.open(info, "r") as f:
                                 contents = f.read()
-                            if not payload.is_binary(info.filename):
+                            if should_convert(info.filename, payload):
                                 contents = contents.replace(b'\n', b'\r\n')
                             target = os.path.join(unpack, info.filename)
                             os.makedirs(os.path.dirname(target), exist_ok=True)
